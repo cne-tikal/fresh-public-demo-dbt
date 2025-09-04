@@ -1,0 +1,176 @@
+name: DBT Build
+
+on:
+  push:
+    branches:
+      - main #
+  pull_request:
+    types: [closed, opened, synchronize]  # 👈 Add this trigger for PR closures      
+
+
+jobs:
+  run-dbt:
+    name: Build DBT Models
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # This gives permission to push tags
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+            python-version: '3.12'
+    
+      - name: Write BIGQUERY_KEYFILE_JSON to File
+        env:
+          BIGQUERY_KEYFILE_JSON_BASE64: ${{ secrets.BIGQUERY_KEYFILE_JSON_BASE64 }}
+        run: |
+          echo "$BIGQUERY_KEYFILE_JSON_BASE64" | base64 --decode > /tmp/bigquery-keyfile.json
+          echo "BIGQUERY_KEYFILE_PATH=/tmp/bigquery-keyfile.json" >> $GITHUB_ENV
+  
+      - name: Calc dataset name
+        run: |        
+          echo "github_ref: ${{ github.ref }}"
+          echo "event_name: ${{ github.event_name }}"
+          echo "action: ${{ github.event.action }}"
+          echo "number: ${{ github.event.number }}"
+
+          branch_name=${{ github.event.number }}
+
+          # If the branch is main, append the latest short commit hash
+          if [ -z "$branch_name" ] || [ "$branch_name" == "main" ]; then
+            short_commit_hash=$(git rev-parse --short HEAD)
+            branch_name="${branch_name}_${short_commit_hash}"
+          fi
+          
+          dataset_name=$(echo "$branch_name" | sed 's/[^a-zA-Z0-9_]/_/g')
+          echo "dataset_name: SAAS_pr__${dataset_name}"
+          echo "DB_NAME=pr__${dataset_name}" >> $GITHUB_ENV        
+
+      - name: Install the latest version of uv
+        run: |
+            curl -LsSf https://astral.sh/uv/install.sh | sh
+            echo "$HOME/.local/bin" >> $GITHUB_PATH
+            export PATH="$HOME/.local/bin:$PATH"            
+            uv venv
+            uv pip install --upgrade setuptools
+            uv sync
+            uv pip install -e .
+  
+
+      - uses: robinraju/release-downloader@v1
+        with:
+          latest: true
+          out-file-path: target/last_run
+          fileName: '*.json'
+
+
+      - name: Run File Validation
+        env:
+          DATASET_PREFIX: "CI_"
+          DBT_PROFILE_PROJECT: ${{ vars.DBT_PROFILE_PROJECT }}
+          BIGQUERY_DATABASE: ${{ vars.BIGQUERY_DATABASE }}        
+
+        run: |
+          source .venv/bin/activate        
+          dbt deps
+          dbt parse
+          pre-commit run --all-files
+            
+  
+      - name: Run DBT
+        if: (github.event_name == 'push') || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize'))
+        env:
+          DATASET_PREFIX: "CI_"
+          DBT_SCHEMA: "CI_DWH"
+          DBT_PROFILE_PROJECT : ${{ secrets.DBT_PROFILE_PROJECT }}
+          BIGQUERY_DATABASE: ${{ vars.BIGQUERY_DATABASE }}        
+        run: |
+          source .venv/bin/activate      
+          dbt deps          
+          dbt debug --debug
+          # dbt run-operation create_database --args "{database_name: ${DBT_PROFILE_PROJECT}.${DBT_SCHEMA}}"
+          # dbt run-operation create_database --args "{database_name: ${DBT_SCHEMA}_GOLD}"
+          # dbt run-operation create_database --args "{database_name: ${DBT_SCHEMA}_SILVER}"
+          dbt build 
+          if ${{ github.ref == 'refs/heads/main' }}; then
+            dbt build 
+          else
+            dbt build --select "+state:modified+" --state ./target/last_run
+          fi
+                    
+      - name: Prepare Docs Site Artifact
+        if: (github.event_name == 'push')
+        env:
+          DATASET_PREFIX: "CI_"
+          DBT_SCHEMA: "CI_DWH"
+          DBT_PROFILE_PROJECT : ${{ secrets.DBT_PROFILE_PROJECT }}
+          BIGQUERY_DATABASE: ${{ vars.BIGQUERY_DATABASE }}        
+
+        run: |
+          source .venv/bin/activate          
+          dbt docs generate --static
+          mkdir -p docs_site
+          cp target/static_index.html target/index.html target/manifest.json target/catalog.json docs_site
+
+      - name: Extract release version
+        if: (github.event_name == 'push')
+        run: |
+          # Get today's date in YYYY.MM format
+          TODAY=$(date +"%Y.%m")
+
+          # Fetch existing tags
+          git fetch --tags > /dev/null 2>&1
+          EXISTING_TAGS=$(git tag | grep "^$TODAY" | sort -V)
+
+          # Determine the next increment
+          if [[ -z "$EXISTING_TAGS" ]]; then
+              NEW_TAG="${TODAY}.1"
+          else
+              LAST_TAG=$(echo "$EXISTING_TAGS" | tail -n 1)
+              LAST_INCREMENT=${LAST_TAG##*.}  # Extract the last number
+              NEW_TAG="${TODAY}.$((LAST_INCREMENT + 1))"
+          fi
+
+          # Print the new tag
+          echo "$NEW_TAG"
+          echo "RELEASE_VERSION=$NEW_TAG" >> $GITHUB_ENV
+
+   
+      - name: Create and push Git tag
+        if: (github.event_name == 'push')
+        run: |
+          git tag $RELEASE_VERSION
+          git push origin $RELEASE_VERSION
+
+      - name: Upload release asset
+        if: (github.event_name == 'push')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_VERSION }}
+          files: |
+              target/static_index.html
+              target/index.html
+              target/manifest.json
+              target/catalog.json
+              target/run_results.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup (e.g., delete resources tied to the branch)
+        if:  (github.event.action == 'closed' || github.ref == 'refs/heads/main')
+        env:
+          DATASET_PREFIX: "CI_"
+          DBT_SCHEMA: "CI_DWH"
+          DBT_PROFILE_PROJECT : ${{ secrets.DBT_PROFILE_PROJECT }}
+          BIGQUERY_DATABASE: ${{ vars.BIGQUERY_DATABASE }}        
+
+        run: |
+            source .venv/bin/activate          
+            dbt deps
+            dbt run-operation delete_database --args "{database_name: ${DBT_PROFILE_PROJECT}.${DBT_SCHEMA}}"
