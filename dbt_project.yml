@@ -1,0 +1,59 @@
+name: "tikal_dbt"
+version: "1.0.0"
+config-version: 2
+profile: "tikal_dbt"
+test-paths: ["tests"]
+snapshot-paths: ["snapshots"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+dispatch:
+  - macro_namespace: dbt
+    search_order:
+      - tikal_dbt
+      - dbt
+
+
+  
+
+vars:
+  organization_id: "{{ env_var('ORG_ID', '2f2e4840-a901-424a-ba56-4404b64acb87') }}"
+  job_id: c8b38a6b-887c-4777-a413-6c68bfa46f80 #for local build
+  scoring_job_id: bc7b0139-84df-4062-be45-9fca853a4645 #for local build
+  instance_id: 46f1603d-b625-4c04-b99d-fdfc1592f196
+  source_database: "SAAS_STAGING"
+  marts_extension: "_marts"
+  staging_extension: "_staging"
+  staging_fqn: "staging"
+  marts_fqn: "marts"
+  staging_table_part: "_stg"
+  package_name: "tikal_dbt"
+  enable_separate_db: False
+
+models:
+  dbt_bigquery_monitoring:
+    +schema: "dbt_bigquery_monitoring"
+    +tags:
+      - bigquery_monitoring
+
+  elementary:
+    ## elementary models will be created in the schema '<your_schema>_elementary'
+    +schema: "elementary"
+    +tags:
+      - elementary
+    ## To disable elementary for dev, uncomment this:
+    # enabled: "{{ target.name in ['prod','analytics'] }}"
+
+  tikal_dbt:
+  
+  #for incremental models
+  +on_schema_change: "sync_all_columns"
+
+
+flags:
+  require_explicit_package_overrides_for_builtin_materializations: False
+  source_freshness_run_project_hooks: True
+  
