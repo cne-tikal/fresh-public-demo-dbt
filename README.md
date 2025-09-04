@@ -1,2 +1,1 @@
-# fresh-public-demo-dbt
-Data platform dbt for fresh-public-demo (created from tikalk/cne-dbt-template)
+successfully downloaded text file (SHA: f77d9fb8e4aa8403f13b4fea7437186b5a0ae217)
